@@ -429,6 +429,7 @@ def rasterization(
     if packed:
         # The results are packed into shape [nnz, ...]. All elements are valid.
         (
+            indptr,
             batch_ids,
             camera_ids,
             gaussian_ids,
@@ -446,6 +447,7 @@ def rasterization(
         opacities = torch.broadcast_to(
             opacities[..., None, :], batch_dims + (C, N)
         )  # [..., C, N]
+        indptr = None
         batch_ids, camera_ids, gaussian_ids = None, None, None
         image_ids = None
 
@@ -493,10 +495,33 @@ def rasterization(
             campos_rs = torch.inverse(viewmats_rs)[..., :3, 3]
             campos = 0.5 * (campos + campos_rs)  # [..., C, 3]
         if packed:
-            dirs = (
-                means.view(B, N, 3)[batch_ids, gaussian_ids]
-                - campos.view(B, C, 3)[batch_ids, camera_ids]
-            )  # [nnz, 3]
+            # Compute dirs in B*C steps to avoid many-to-one indexing in backward pass
+            # indptr[i] gives the start index for batch-camera pair i
+            # indptr[i+1] - indptr[i] gives the count for batch-camera pair i
+            nnz = batch_ids.shape[0]
+            dirs = torch.empty((nnz, 3), dtype=means.dtype, device=means.device)
+            means_flat = means.view(B, N, 3)
+            campos_flat = campos.view(B, C, 3)
+
+            for b_idx in range(B):
+                for c_idx in range(C):
+                    bc_idx = b_idx * C + c_idx
+                    start_idx = indptr[bc_idx].item()
+                    end_idx = indptr[bc_idx + 1].item()
+                    if start_idx == end_idx:
+                        continue  # No gaussians for this batch-camera pair
+
+                    # Get the gaussian indices for this batch-camera pair
+                    gids = gaussian_ids[start_idx:end_idx]
+
+                    # Compute dirs for this batch-camera pair
+                    # means_flat[b_idx, gids] has shape [n_gaussians, 3]
+                    # campos_flat[b_idx, c_idx] has shape [3]
+                    # Broadcasting gives [n_gaussians, 3]
+                    dirs[start_idx:end_idx] = (
+                        means_flat[b_idx, gids] - campos_flat[b_idx, c_idx]
+                    )
+
             masks = (radii > 0).all(dim=-1)  # [nnz]
             if colors.dim() == num_batch_dims + 3:
                 # Turn [..., N, K, 3] into [nnz, 3]
